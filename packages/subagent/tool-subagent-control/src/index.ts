@@ -24,11 +24,20 @@ export const inject = ['tools', 'subagents', 'agents', 'systemPrompt']
 export interface Config {
   /** Register `interrupt_agent`. Defaults to true; false leaves the service API available. */
   interrupt?: boolean
+  /**
+   * Waits one agent may spend within a single turn before `wait_agent` refuses
+   * and demands a text answer. Waiting is not work: each wait is a full model
+   * request that resends the whole context, and an unbounded wait loop was
+   * measured at 84.5 percent of the input tokens of one Team session. Zero
+   * disables the bound.
+   */
+  maxWaitsPerTurn?: number
 }
 
 /** Loader schema for optional subagent control tools. */
 export const Config: z<Config> = z.object({
   interrupt: z.boolean().default(true),
+  maxWaitsPerTurn: z.number().step(1).min(0).default(2),
 })
 
 /**
@@ -39,7 +48,7 @@ export const Config: z<Config> = z.object({
 export function apply(ctx: Context, config: Config = {}): void {
   const interrupt = config.interrupt !== false
   const listAgents = registerListAgents(ctx)
-  registerWaitAgent(ctx)
+  registerWaitAgent(ctx, config.maxWaitsPerTurn ?? 2)
   const sendMessage = defineTool({
     name: 'send_message',
     description:

@@ -302,3 +302,96 @@ describe('wait_agent', () => {
     expect(await result).toMatchObject({ isError: true, error: { info: { code: 'WAIT_UNAVAILABLE' } } })
   })
 })
+
+describe('wait_agent budget', () => {
+  it('refuses a wait once the turn budget is spent and names the reason', async () => {
+    const { ctx, agent } = await setup()
+    const definition = ctx.tools.get('wait_agent')!
+    // Every admitted wait here times out immediately, so the budget is the only
+    // thing that can refuse the third call in the same turn.
+    vi.useFakeTimers()
+    for (const callId of ['first', 'second']) {
+      const { result } = await startWait(ctx, agent, { timeout_ms: 10_000 }, undefined, callId)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(await result).toMatchObject({ isError: false, value: { timedOut: true } })
+    }
+    const refused = await executeToolFixture(ctx, {
+      name: 'wait_agent',
+      callId: ToolCallId('third'),
+      arguments: { timeout_ms: 10_000 },
+      agent,
+      signal: new AbortController().signal,
+    })
+    expect(refused).toMatchObject({ isError: true, error: { info: { code: 'WAIT_BUDGET_EXHAUSTED' } } })
+    expect(refused.content.flatMap(block => block.type === 'text' ? [block.text] : []).join(''))
+      .toContain('budget for this turn is exhausted (2 waits)')
+    expect(vi.getTimerCount()).toBe(0)
+    expect(definition.name).toBe('wait_agent')
+  })
+
+  it('restores the full budget on the next turn', async () => {
+    const { ctx, agent } = await setup()
+    vi.useFakeTimers()
+    for (const callId of ['first', 'second']) {
+      const { result } = await startWait(ctx, agent, { timeout_ms: 10_000 }, undefined, callId)
+      await vi.advanceTimersByTimeAsync(10_000)
+      await result
+    }
+    const spent = await executeToolFixture(ctx, {
+      name: 'wait_agent', callId: ToolCallId('spent'), arguments: {}, agent, signal: new AbortController().signal,
+    })
+    expect(spent).toMatchObject({ isError: true, error: { info: { code: 'WAIT_BUDGET_EXHAUSTED' } } })
+
+    // A new turn resets the count, because a long task legitimately spans many
+    // turns while a single turn that only waits is waste. The turn boundary
+    // comes from the session log, so a real follow-up turn is what advances it.
+    vi.useRealTimers()
+    agent.followup(input('continue'))
+    await agent.whenIdle()
+    vi.useFakeTimers()
+    const fresh = await startWait(ctx, agent, { timeout_ms: 10_000 }, undefined, 'after-turn')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(await fresh.result).toMatchObject({ isError: false, value: { timedOut: true } })
+  })
+
+  it('treats zero as unbounded instead of blocking every wait', async () => {
+    const { ctx, agent, fiber } = await setup()
+    await fiber.dispose()
+    await ctx.plugin(control, { maxWaitsPerTurn: 0 })
+    vi.useFakeTimers()
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const { result } = await startWait(ctx, agent, { timeout_ms: 10_000 }, undefined, `call-${attempt}`)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(await result).toMatchObject({ isError: false, value: { timedOut: true } })
+    }
+  })
+
+  it('budgets waits independently for each agent', async () => {
+    const { ctx, agent, other } = await setup()
+    vi.useFakeTimers()
+    for (const callId of ['first', 'second']) {
+      const { result } = await startWait(ctx, agent, { timeout_ms: 10_000 }, undefined, callId)
+      await vi.advanceTimersByTimeAsync(10_000)
+      await result
+    }
+    const exhausted = await executeToolFixture(ctx, {
+      name: 'wait_agent', callId: ToolCallId('exhausted'), arguments: {}, agent, signal: new AbortController().signal,
+    })
+    expect(exhausted).toMatchObject({ isError: true, error: { info: { code: 'WAIT_BUDGET_EXHAUSTED' } } })
+
+    // Another agent's budget is its own.
+    const peer = await startWait(ctx, other, { timeout_ms: 10_000 }, undefined, 'peer-call')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(await peer.result).toMatchObject({ isError: false, value: { timedOut: true } })
+  })
+
+  it('admits input before spending the budget', async () => {
+    const { ctx, agent } = await setup()
+    // Pending input settles the wait without consuming a turn budget slot.
+    agent.inject(input('immediate'))
+    for (const callId of ['a', 'b', 'c']) {
+      const { result } = await startWait(ctx, agent, {}, undefined, callId)
+      expect(await result).toMatchObject({ isError: false, value: { timedOut: false } })
+    }
+  })
+})
