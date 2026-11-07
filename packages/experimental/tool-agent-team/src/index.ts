@@ -21,6 +21,14 @@ export interface Config {
   readonly freshProvider?: string
   /** Continuable-subagent provider used for completed-prefix fork teammates. */
   readonly forkProvider?: string
+  /**
+   * Maximum `wait_agent` calls one agent may make within a single turn before
+   * the tool refuses further waits and demands a text answer. Waiting is not
+   * work: each wait is a full model request that resends the whole context, so
+   * an unbounded wait loop is the single largest source of token spend in a
+   * Team session. Zero disables the budget.
+   */
+  readonly maxWaitsPerTurn?: number
 }
 
 /** Loader schema for the opt-in Team tool plugin. */
@@ -28,7 +36,11 @@ export const Config: z<Config> = z.object({
   interrupt: z.boolean().default(true),
   freshProvider: z.string().default('spawn'),
   forkProvider: z.string().default('fork'),
+  maxWaitsPerTurn: z.number().step(1).min(0).default(2),
 })
+
+/** Result of one admitted or refused wait attempt. */
+type WaitAdmission = { readonly admitted: true } | { readonly admitted: false; readonly message: string }
 
 /** Model-facing collaboration guidance shared by Lead and teammates. */
 function teamPolicy(interrupt: boolean): string {
@@ -116,7 +128,7 @@ const WAIT_VALUE_SCHEMA = {
       type: 'object',
       additionalProperties: false,
       properties: {
-        reason: { type: 'string', required: true, const: 'no-active-peer' },
+        reason: { type: 'string', required: true, enum: ['no-active-peer', 'wait-budget-exhausted'] },
         message: { type: 'string', required: true },
       },
     },
@@ -169,6 +181,31 @@ function install(agent: Agent, ctx: Context, config: Required<Config>): () => vo
   const scoped = agent.ctx
   const disposers: Array<() => unknown> = []
   const register = (disposer: () => unknown): void => { disposers.push(disposer) }
+  /**
+   * Waits admitted in the current turn, and the turn they belong to. A turn
+   * boundary resets the count so the budget applies per turn rather than per
+   * session. `wait_agent` is a full model request, so the budget is what keeps
+   * a waiting loop from becoming the dominant token cost of a Team session.
+   */
+  let waitsThisTurn = 0
+  let waitTurn: number | undefined
+  const admitWait = (turn: number): WaitAdmission => {
+    if (config.maxWaitsPerTurn === 0) return { admitted: true }
+    if (waitTurn !== turn) {
+      waitTurn = turn
+      waitsThisTurn = 0
+    }
+    if (waitsThisTurn >= config.maxWaitsPerTurn) {
+      return {
+        admitted: false,
+        message: `wait_agent budget for this turn is exhausted (${config.maxWaitsPerTurn} waits). `
+          + 'Waiting is not progress: each wait resends the whole context as a new model request. '
+          + 'Do not wait again in this turn. Report the current state, the exact blocker, and what you need from the user, then end the turn.',
+      }
+    }
+    waitsThisTurn += 1
+    return { admitted: true }
+  }
   try {
     register(scoped.systemPrompt.section({
       name: 'team:policy',
@@ -248,7 +285,7 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
 
     register(scoped.tools.register(defineTool({
       name: 'wait_agent',
-      description: 'Wait for the next teammate status, message, or shared-task change after this call starts. This never wakes inactive members and returns noProgress immediately when no other member is running or provisioning. Re-list after wakeup or timeout instead of polling.',
+      description: 'Wait for the next teammate status, message, or shared-task change after this call starts. This never wakes inactive members and returns noProgress immediately when no other member is running or provisioning. Re-list after wakeup or timeout instead of polling. The number of waits in one turn is bounded; when the budget is exhausted the tool refuses and you must answer in text instead of waiting again.',
       parameters: {
         timeout_ms: {
           type: 'integer',
@@ -266,6 +303,20 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
         }
         // The active-peer read and waiter registration must remain one synchronous
         // span; awaiting between them can lose the only peer-status edge.
+        //
+        // The budget check is deliberately part of that same synchronous span:
+        // admission and the active-peer read cannot disagree about the turn.
+        const activeTurn = ctx.agents.turnBoundaryOf(agent.session).lastTurn
+        const admission = admitWait(activeTurn)
+        if (!admission.admitted) {
+          return {
+            timedOut: false,
+            noProgress: {
+              reason: 'wait-budget-exhausted' as const,
+              message: admission.message,
+            },
+          }
+        }
         const hasActivePeer = ctx.agentTeams.listMembers(caller).some(member =>
           member.id !== caller.id && ACTIVE_WAIT_STATUSES.has(member.status))
         if (!hasActivePeer) {
@@ -413,6 +464,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     interrupt: config.interrupt ?? true,
     freshProvider: config.freshProvider ?? 'spawn',
     forkProvider: config.forkProvider ?? 'fork',
+    maxWaitsPerTurn: config.maxWaitsPerTurn ?? 2,
   }
   const installed = new Map<Agent, () => void>()
   const maybeInstall = (agent: Agent): void => {

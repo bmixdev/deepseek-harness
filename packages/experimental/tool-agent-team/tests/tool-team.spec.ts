@@ -779,4 +779,107 @@ describe('dsh-tool-team', () => {
     await vi.waitFor(() => { expect(ctx.agents.get(childId)).toBeUndefined() }, { timeout: 5_000 })
     expect(ctx.agentTeams.listMembers(lead)[1]).toMatchObject({ provider: 'team-fresh' })
   })
+
+  it('bounds waits per turn and demands a text answer when the budget is spent', async () => {
+    // Waiting is not work: each wait is a full model request that resends the
+    // whole context. The budget is what stops a waiting loop from becoming the
+    // dominant token cost of a Team session.
+    const { ctx, lead } = await setup(['hang'])
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'busy-worker', description: 'stay active', prompt: 'wait',
+    })
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitRunning(ctx, childId)
+
+    for (const remaining of [1, 0]) {
+      const admitted = await execute(ctx, lead, 'wait_agent', { timeout_ms: 10_000 })
+      // An admitted wait that finds no edge times out; it never reports the budget.
+      expect(JSON.parse(text(admitted))).toEqual({ timedOut: true })
+      expect(remaining).toBeGreaterThanOrEqual(0)
+    }
+    const refused = await execute(ctx, lead, 'wait_agent', { timeout_ms: 10_000 })
+    const parsed = JSON.parse(text(refused)) as { timedOut: boolean; noProgress: { reason: string; message: string } }
+    expect(parsed.timedOut).toBe(false)
+    expect(parsed.noProgress.reason).toBe('wait-budget-exhausted')
+    expect(parsed.noProgress.message).toContain('budget for this turn is exhausted')
+    expect(parsed.noProgress.message).toContain('end the turn')
+    await execute(ctx, lead, 'interrupt_agent', { target: 'busy-worker' })
+    await waitNoAgent(ctx, childId)
+  })
+
+  it('restores the full wait budget on the next turn', async () => {
+    const { ctx, lead } = await setup(['hang', textResponse('lead answered')])
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'worker', description: 'stay active', prompt: 'wait',
+    })
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitRunning(ctx, childId)
+    await execute(ctx, lead, 'wait_agent', { timeout_ms: 10_000 })
+    await execute(ctx, lead, 'wait_agent', { timeout_ms: 10_000 })
+    const spent = await execute(ctx, lead, 'wait_agent', { timeout_ms: 10_000 })
+    expect(JSON.parse(text(spent)).noProgress.reason).toBe('wait-budget-exhausted')
+
+    // A new turn resets the count: a long task legitimately spans many turns.
+    await runTurn(lead, 'keep going')
+    const afterTurn = await execute(ctx, lead, 'wait_agent', { timeout_ms: 10_000 })
+    expect(JSON.parse(text(afterTurn))).toEqual({ timedOut: true })
+    await execute(ctx, lead, 'interrupt_agent', { target: 'worker' })
+    await waitNoAgent(ctx, childId)
+  })
+
+  it('treats a zero budget as unbounded instead of blocking every wait', async () => {
+    const { ctx, lead, fiber } = await setup(['hang'])
+    await fiber.dispose()
+    await ctx.plugin(toolTeam, { maxWaitsPerTurn: 0 })
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'worker', description: 'stay active', prompt: 'wait',
+    })
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitRunning(ctx, childId)
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = await execute(ctx, lead, 'wait_agent', { timeout_ms: 10_000 })
+      expect(JSON.parse(text(result))).toEqual({ timedOut: true })
+    }
+    await execute(ctx, lead, 'interrupt_agent', { target: 'worker' })
+    await waitNoAgent(ctx, childId)
+  })
+
+  it('budgets waits independently for each Team member', async () => {
+    const { ctx, lead } = await setup(['hang', 'hang'])
+    const first = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'worker-one', description: 'stay active', prompt: 'wait',
+    })
+    const second = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'worker-two', description: 'stay active', prompt: 'wait',
+    })
+    const firstId = spawnedChildId(ctx, lead, first)
+    const secondId = spawnedChildId(ctx, lead, second)
+    const child = await waitRunning(ctx, secondId)
+    await waitRunning(ctx, firstId)
+
+    // Spend the child's budget; the Lead's own budget must not be affected.
+    await execute(ctx, child, 'wait_agent', { timeout_ms: 10_000 })
+    await execute(ctx, child, 'wait_agent', { timeout_ms: 10_000 })
+    const childRefused = await execute(ctx, child, 'wait_agent', { timeout_ms: 10_000 })
+    expect(JSON.parse(text(childRefused)).noProgress.reason).toBe('wait-budget-exhausted')
+    const leadAdmitted = await execute(ctx, lead, 'wait_agent', { timeout_ms: 10_000 })
+    expect(JSON.parse(text(leadAdmitted))).toEqual({ timedOut: true })
+
+    await execute(ctx, lead, 'interrupt_agent', { target: 'worker-one' })
+    await execute(ctx, lead, 'interrupt_agent', { target: 'worker-two' })
+    await waitNoAgent(ctx, firstId)
+    await waitNoAgent(ctx, secondId)
+  })
+
+  it('keeps the no-active-peer shortcut ahead of the budget', async () => {
+    const { ctx, lead } = await setup([textResponse('worker done')])
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'idle-worker', description: 'finish immediately', prompt: 'finish',
+    })
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitNoAgent(ctx, childId)
+    // The budget is still full, so the inspection shortcut is what answers.
+    const result = await execute(ctx, lead, 'wait_agent', { timeout_ms: 3_600_000 })
+    expect(JSON.parse(text(result)).noProgress.reason).toBe('no-active-peer')
+  })
 })
