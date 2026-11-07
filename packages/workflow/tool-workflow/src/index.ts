@@ -38,7 +38,7 @@ declare module '@deepseek-ai/dsh-jobs' {
 }
 
 export const name = 'tool-workflow'
-export const inject = ['tools', 'workflowEngine', 'systemPrompt']
+export const inject = ['tools', 'workflowEngine', 'systemPrompt', 'agents']
 
 /** Config: the model-facing tool name plus result rendering caps. */
 export interface Config {
@@ -54,12 +54,28 @@ export interface Config {
    * piece named.
    */
   enableRunInBackground?: boolean
+  /**
+   * How many runs with the same `meta.name` one agent may start in a single
+   * turn (default 1). A repeat is a retry, not new work: the model reworded a
+   * script and started it again, and every child is a separate session with its
+   * own context window. One real single-agent session ran three workflows named
+   * `integration-spikes` in one turn. Zero disables the bound.
+   */
+  maxRunsPerNamePerTurn?: number
+  /**
+   * How many agents one run may start before the engine refuses the fan-out
+   * (default 4). More than four means the work is not decomposed; zero
+   * disables the bound.
+   */
+  maxAgentsPerRun?: number
 }
 
 export const Config: z<Config> = z.object({
   toolName: z.string().default('workflow'),
   maxResultChars: z.natural().min(1).default(50_000),
   enableRunInBackground: z.boolean().default(true),
+  maxRunsPerNamePerTurn: z.number().step(1).min(0).default(1),
+  maxAgentsPerRun: z.number().step(1).min(0).default(4),
 })
 
 type ResolvedConfig = Required<Config>
@@ -318,9 +334,35 @@ function startBackgroundRun(
 export function apply(ctx: Context, config: Config): void {
   // schemastery (the exported Config schema) has already filled the defaulted
   // fields; the assertion records that resolution, not a hidden fallback.
-  const { toolName, maxResultChars, enableRunInBackground } = config as ResolvedConfig
+  const { toolName, maxResultChars, enableRunInBackground, maxRunsPerNamePerTurn } = config as ResolvedConfig
   const recorder = createWorkflowRecorder(ctx)
   const mirror = createWorkflowRecordMirror(ctx)
+  /**
+   * Runs started per workflow name in the current turn, and the turn they
+   * belong to. A repeat name is a retry rather than new work, so the bound
+   * fires before the engine starts a second run and its children.
+   */
+  const runsByName = new Map<string, number>()
+  let runTurn: number | undefined
+  const admitRun = (agent: Agent, name: string): { admitted: true } | { admitted: false; message: string } => {
+    if (maxRunsPerNamePerTurn === 0) return { admitted: true }
+    const turn = ctx.agents.turnBoundaryOf(agent.session).lastTurn
+    if (runTurn !== turn) {
+      runTurn = turn
+      runsByName.clear()
+    }
+    const used = runsByName.get(name) ?? 0
+    if (used >= maxRunsPerNamePerTurn) {
+      return {
+        admitted: false,
+        message: `workflow "${name}" already ran ${used} time(s) in this turn. `
+          + 'A repeat run is a retry, not new work, and every child is a separate session with its own context window. '
+          + 'Read the previous result, fix the dispatch, or report the blocker and end the turn.',
+      }
+    }
+    runsByName.set(name, used + 1)
+    return { admitted: true }
+  }
   // Usage policy ships with the tool (the master convention: tool guidance
   // lives in tool plugins as prompt sections, not in the deployment persona).
   ctx.systemPrompt.section({
@@ -414,6 +456,8 @@ export function apply(ctx: Context, config: Config): void {
         // parent to attribute the children to. Fail loud rather than guess.
         throw new Error('workflow tool requires a calling agent (exec.agent was undefined)')
       }
+      const admission = admitRun(parent, args.meta.name)
+      if (!admission.admitted) throw new Error(admission.message)
       if (args.run_in_background === true) {
         if (!enableRunInBackground) {
           throw new Error('run_in_background is disabled for this tool')
