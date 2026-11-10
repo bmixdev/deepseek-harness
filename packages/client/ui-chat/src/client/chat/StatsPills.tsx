@@ -1,12 +1,13 @@
 // Composer statistics pills, each its own 'conversation.composer.dock' list
 // entry (activity, usage) so a plugin can replace or add one pill by id.
-// Compact keeps speed and cache hit as plain readings; Detailed adds counts,
-// token totals, and click-open dialogs. Settled-node identity prevents
-// stream-delta updates from rerendering the pills.
+// Compact keeps speed and cache hit as plain readings, and the cache reading
+// opens a hover popover carrying the token counts no dialog exposes in that
+// mode; Detailed adds counts, token totals, and click-open dialogs. Settled-node
+// identity prevents stream-delta updates from rerendering the pills.
 
 import { memo, useMemo, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { IconDatabaseOutlineRegular, IconGaugeOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import { HoverCard, IconDatabaseOutlineRegular, IconGaugeOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { UseProjection } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { InjectFace, SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: merges the sessionStats key into SessionProjectionMap for useProjection.
@@ -178,17 +179,24 @@ function decodeSpeed(stats: WindowStats, t: Translate): string {
 /** The full reading above a pill, only while an ellipsis cuts its label; the delay matches the dock's context meter. */
 const FULL_READING_TOOLTIP = { side: 'top', portal: true, delayMs: 200, onlyWhenClipped: true } as const
 
-/** A static reading: used when the pill has no dialog rows or the mode is Compact. */
-function PlainPill({ stat, icon, label, text }: PillContent) {
+/**
+ * A static reading: used when the pill has no dialog rows or the mode is Compact.
+ * A reading with a hover body shows that body instead of the cut-off tooltip,
+ * because the body repeats the reading and adds the figures behind it.
+ */
+function PlainPill({ stat, icon, label, text, hoverContent }: PillContent & { hoverContent?: ReactNode }) {
+  const pill = (
+    <span className={css.pill}>
+      {icon}
+      <span className={css.label}>{label}</span>
+    </span>
+  )
   return (
     <span className={css.anchor} data-composer-stat={stat}>
-      {/* No dialog carries a static reading, so a tap also pins the full text. */}
-      <Tooltip label={text} {...FULL_READING_TOOLTIP} openOnClick>
-        <span className={css.pill}>
-          {icon}
-          <span className={css.label}>{label}</span>
-        </span>
-      </Tooltip>
+      {hoverContent === undefined
+        // No dialog carries a static reading, so a tap also pins the full text.
+        ? <Tooltip label={text} {...FULL_READING_TOOLTIP} openOnClick>{pill}</Tooltip>
+        : <HoverCard anchor={pill} content={hoverContent} inline fitContent openDelayMs={200} />}
     </span>
   )
 }
@@ -293,6 +301,37 @@ export const ActivityPill = memo(function ActivityPill({ useChat, useProjection,
   )
 })
 
+/**
+ * Hover body for the Compact cache-hit reading: the share, the prompt tokens it
+ * is measured against, and the share served from cache.
+ * @param usage - the session's token-usage projection value.
+ * @param cacheHit - display-ready cache-hit percentage.
+ * @param t - the owning dock's locale seat.
+ * @returns the popover rows.
+ */
+function cacheHoverContent(usage: TokenUsageProjection, cacheHit: string, t: Translate): ReactNode {
+  return (
+    <>
+      {/* jscpd:ignore-start -- the dialog's bucket rows at this mode's detail level */}
+      <dl className={dialogCss.details} data-session-stats-cache>
+        <dt>{t('message.turnUsage.cacheHit')}</dt>
+        <dd>{`${cacheHit}%`}</dd>
+        <dt>{t('message.turnUsage.cacheRead')}</dt>
+        <dd>{exactCount(usage.cacheReadTokens, t)}</dd>
+        <dt>{t('stats.cacheHit.prompt')}</dt>
+        <dd>{exactCount(billedInputTokens(usage), t)}</dd>
+        {usage.cacheWriteTokens !== 0 && (
+          <>
+            <dt>{t('message.turnUsage.cacheWrite')}</dt>
+            <dd>{exactCount(usage.cacheWriteTokens, t)}</dd>
+          </>
+        )}
+      </dl>
+      {/* jscpd:ignore-end */}
+    </>
+  )
+}
+
 /** Whole-log token total and cache hit; Compact keeps only the cache hit. */
 export const UsagePill = memo(function UsagePill({ useProjection, usePerformanceUsage, t }: StatPillProps) {
   const mode = usePerformanceUsage(value => value)
@@ -301,11 +340,22 @@ export const UsagePill = memo(function UsagePill({ useProjection, usePerformance
   // billing (e.g. every request failed) shows no usage pill.
   if (usage === undefined || (billedInputTokens(usage) === 0 && usage.outputTokens === 0)) return null
   const cacheHit = cacheHitPercent(usage)
-  const cacheHitText = cacheHit !== null ? t('stats.cacheHit', { percent: cacheHit }) : null
   const icon = <IconDatabaseOutlineRegular />
   if (mode === 'compact') {
-    return cacheHitText === null ? null : <PlainPill stat="usage" icon={icon} {...reading(cacheHitText, null)} />
+    if (cacheHit === null) return null
+    const cacheHitText = t('stats.cacheHit', { percent: cacheHit })
+    // The static reading carries the share only; hovering it adds the counts.
+    return (
+      <PlainPill
+        stat="usage"
+        icon={icon}
+        label={cacheHitText}
+        text={cacheHitText}
+        hoverContent={cacheHoverContent(usage, cacheHit, t)}
+      />
+    )
   }
+  const cacheHitText = cacheHit !== null ? t('stats.cacheHit', { percent: cacheHit }) : null
   // Same aggregate as the Turn pill's totalTokens: every prompt-side billing bucket plus output.
   const total = billedInputTokens(usage) + usage.outputTokens
   const totalText = t('message.turnUsage.count', { count: formatTokens(total, t) })

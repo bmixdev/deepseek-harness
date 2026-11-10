@@ -168,6 +168,7 @@
     "tests/seeded-history.e2e.ts",
     "tests/stats-paged-history.e2e.ts",
     "tests/stats-truncated-tooltip.e2e.ts",
+    "tests/composer-stats-cache-popover.e2e.ts",
     "tests/sidebar-scrollbar.e2e.ts",
     "tests/sidebar-alignment.e2e.ts",
     "tests/sidebar-title-hover-scroll.e2e.ts",

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import type {
   AssistantMessageNode, ChatSnapshot, LegacyConversationSlice, ToolResultNode,
@@ -415,10 +415,105 @@ describe('composer stats pills', () => {
 
     it('pins a cut-off static reading on tap', () => {
       const view = renderCut(true, 'compact')
-      const plainPill = view.getByText('Cache hit 90%').parentElement!
+      // Compact cache reads show a hover popover instead of the cut-off tooltip,
+      // so the plain reading left to pin is the speed one.
+      const plainPill = view.getByText('20 tok/s').parentElement!
       fireEvent.pointerDown(plainPill, { pointerType: 'touch' })
       fireEvent.click(plainPill)
-      expect(tooltipText(view)).toBe('Cache hit 90%')
+      expect(tooltipText(view)).toBe('20 tok/s')
+    })
+  })
+
+  describe('compact cache hover popover', () => {
+    /** Pointer entry as the browser delivers it: a bubbling pointerover carrying its device type. */
+    function pointer(type: 'pointerover' | 'pointerout', target: HTMLElement): void {
+      const event = new Event(type, { bubbles: true })
+      Object.defineProperty(event, 'pointerType', { value: 'mouse' })
+      fireEvent(target, event)
+    }
+
+    function renderCompact(cacheReadTokens: number, uncachedInputTokens: number, cacheWriteTokens = 0) {
+      const { source } = makeSource({ nodes: [timedStep()] })
+      const values = {
+        tokenUsage: { uncachedInputTokens, outputTokens: 1, cacheReadTokens, cacheWriteTokens },
+      }
+      return render(<StatsPills {...props(source, values)} usePerformanceUsage={selector => selector('compact')} />)
+    }
+
+    /** The dock renders into the document body, so popovers are queried there. */
+    function popover(): HTMLElement | null {
+      return document.querySelector('[data-session-stats-cache]')
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      vi.stubGlobal('matchMedia', (query: string) => ({ matches: query === '(any-hover: hover)' }))
+    })
+    afterEach(() => {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    })
+
+    it('shows the cached prompt tokens after the hover delay', () => {
+      const view = renderCompact(5_680_000, 100_000)
+      const pill = view.getByText('Cache hit 98%')
+      pointer('pointerover', pill)
+      act(() => { vi.advanceTimersByTime(199) })
+      expect(popover()).toBeNull()
+      act(() => { vi.advanceTimersByTime(1) })
+      expect(popover()?.textContent)
+        .toBe('Cache hit98%Cached input5,680,000 tokPrompt tokens5,780,000 tok')
+    })
+
+    it('closes a grace after the pointer leaves', () => {
+      const view = renderCompact(5_680_000, 100_000)
+      const pill = view.getByText('Cache hit 98%')
+      pointer('pointerover', pill)
+      act(() => { vi.advanceTimersByTime(200) })
+      expect(popover()).not.toBeNull()
+      pointer('pointerout', pill)
+      act(() => { vi.advanceTimersByTime(199) })
+      expect(popover()).not.toBeNull()
+      act(() => { vi.advanceTimersByTime(1) })
+      expect(popover()).toBeNull()
+    })
+
+    it('adds the cache-write row only while the session wrote cache', () => {
+      const view = renderCompact(900, 100, 50)
+      pointer('pointerover', view.getByText('Cache hit 86%'))
+      act(() => { vi.advanceTimersByTime(200) })
+      expect(popover()?.textContent)
+        .toBe('Cache hit86%Cached input900 tokPrompt tokens1,050 tokCache write50 tok')
+    })
+
+    it('reads a fully cached prompt as 100 percent without a missing row', () => {
+      const view = renderCompact(1_000, 0)
+      pointer('pointerover', view.getByText('Cache hit 100%'))
+      act(() => { vi.advanceTimersByTime(200) })
+      expect(popover()?.textContent)
+        .toBe('Cache hit100%Cached input1,000 tokPrompt tokens1,000 tok')
+    })
+
+    it('hides the Compact reading when nothing was billed on the input side', () => {
+      const { source } = makeSource({ nodes: [timedStep()] })
+      const values = {
+        tokenUsage: { uncachedInputTokens: 0, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }
+      const view = render(<StatsPills {...props(source, values)} usePerformanceUsage={selector => selector('compact')} />)
+      expect(view.container.querySelector('[data-composer-stat="usage"]')).toBeNull()
+      // The output-only window still shows the speed reading beside it.
+      expect(view.getByText('20 tok/s')).toBeTruthy()
+    })
+
+    it('keeps the detailed reading on its click-open dialog', () => {
+      const { source } = makeSource({ nodes: [timedStep()] })
+      const view = render(<StatsPills {...props(source)} />)
+      const usage = view.getAllByRole('button')[1]!
+      pointer('pointerover', usage)
+      act(() => { vi.advanceTimersByTime(200) })
+      expect(popover()).toBeNull()
+      fireEvent.click(usage)
+      expect(view.getByRole('dialog')).toBeTruthy()
     })
   })
 
